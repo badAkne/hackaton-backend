@@ -57,67 +57,102 @@ func (s *Store) CreateOrder(ctx context.Context, input domain.CreateOrderInput) 
 		return domain.Order{}, ErrInvalidInput
 	}
 
-	order, err := s.db.Exec(ctx, `
-		INSERT INTO orders (customer_email, status, total_cents)
-		VALUES ($1, 'created', 0)
-	`, input.CustomerEmail)
-	_ = order
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return domain.Order{}, err
 	}
+	defer func() {
+		tx.Rollback(ctx)
+	}()
 
 	var result domain.Order
-	err = s.db.QueryRow(ctx, `
-		SELECT id, customer_email, status, total_cents, created_at
-		FROM orders WHERE customer_email = $1
-		ORDER BY id DESC LIMIT 1
-	`, input.CustomerEmail).Scan(&result.ID, &result.CustomerEmail, &result.Status, &result.Total, &result.CreatedAt)
+
+	err = tx.QueryRow(ctx, `
+        INSERT INTO orders (customer_email, status, total_cents)
+        VALUES ($1, 'created', 0)
+        RETURNING id, customer_email, status, total_cents, created_at
+    `, input.CustomerEmail).Scan(
+		&result.ID,
+		&result.CustomerEmail,
+		&result.Status,
+		&result.Total,
+		&result.CreatedAt,
+	)
 	if err != nil {
 		return domain.Order{}, err
 	}
 
 	var total int64
+
 	for _, item := range input.Items {
-		if item.Quantity <= 0 {
+		if item.ProductID <= 0 || item.Quantity <= 0 {
 			return domain.Order{}, ErrInvalidInput
 		}
 
 		var name string
 		var price int64
-		var stock int
-		err := s.db.QueryRow(ctx, `
-			SELECT name, price_cents, stock FROM products WHERE id = $1
-		`, item.ProductID).Scan(&name, &price, &stock)
+
+		err := tx.QueryRow(ctx, `
+    UPDATE products
+    SET stock = stock - $1
+    WHERE id = $2
+      AND stock >= $1
+    RETURNING name, price_cents
+`, item.Quantity, item.ProductID).Scan(&name, &price)
+
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Order{}, ErrNotFound
-		}
-		if err != nil {
-			return domain.Order{}, err
-		}
-		if stock < item.Quantity {
+			var exists bool
+
+			err = tx.QueryRow(ctx, `
+        SELECT EXISTS (
+            SELECT 1 FROM products WHERE id = $1
+        )
+    `, item.ProductID).Scan(&exists)
+
+			if err != nil {
+				return domain.Order{}, err
+			}
+
+			if !exists {
+				return domain.Order{}, ErrNotFound
+			}
+
 			return domain.Order{}, ErrInsufficientStock
 		}
 
-		_, err = s.db.Exec(ctx, `UPDATE products SET stock = $1 WHERE id = $2`,
-			stock-item.Quantity, item.ProductID)
+		if err != nil {
+			return domain.Order{}, err
+		}
+		_, err = tx.Exec(ctx, `
+            INSERT INTO order_items (
+                order_id,
+                product_id,
+                product_name,
+                quantity,
+                unit_price_cents
+            )
+            VALUES ($1, $2, $3, $4, $5)
+        `, result.ID, item.ProductID, name, item.Quantity, price)
 		if err != nil {
 			return domain.Order{}, err
 		}
 
-		_, err = s.db.Exec(ctx, `
-			INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price_cents)
-			VALUES ($1, $2, $3, $4, $5)
-		`, result.ID, item.ProductID, name, item.Quantity, price)
-		if err != nil {
-			return domain.Order{}, err
-		}
 		total += price * int64(item.Quantity)
 	}
 
-	_, err = s.db.Exec(ctx, `UPDATE orders SET total_cents = $1 WHERE id = $2`, total, result.ID)
+	_, err = tx.Exec(ctx, `
+        UPDATE orders
+        SET total_cents = $1
+        WHERE id = $2
+    `, total, result.ID)
 	if err != nil {
 		return domain.Order{}, err
 	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Order{}, err
+	}
+
 	result.Total = total
 	return result, nil
 }
