@@ -3,15 +3,20 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
+	"net/mail"
+	"strings"
 
 	"github.com/badAkne/hackaton-backend/internal/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var ErrNotFound = errors.New("not found")
 var ErrInsufficientStock = errors.New("insufficient stock")
 var ErrInvalidInput = errors.New("invalid input")
+var ErrConflict = errors.New("conflict")
 
 type Store struct {
 	db *pgxpool.Pool
@@ -21,14 +26,43 @@ func New(db *pgxpool.Pool) *Store {
 	return &Store{db: db}
 }
 
-func (s *Store) CreateProduct(ctx context.Context, sku, name string, price int64, stock int) (domain.Product, error) {
+func (s *Store) CreateProduct(
+	ctx context.Context,
+	sku, name string,
+	price int64,
+	stock int,
+) (domain.Product, error) {
+	sku = strings.TrimSpace(sku)
+	name = strings.TrimSpace(name)
+
+	if sku == "" || name == "" || price < 0 || stock < 0 {
+		return domain.Product{}, ErrInvalidInput
+	}
+
 	var p domain.Product
+
 	err := s.db.QueryRow(ctx, `
-		INSERT INTO products (sku, name, price_cents, stock)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, sku, name, price_cents, stock, created_at
-	`, sku, name, price, stock).Scan(&p.ID, &p.SKU, &p.Name, &p.Price, &p.Stock, &p.CreatedAt)
-	return p, err
+        INSERT INTO products (sku, name, price_cents, stock)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, sku, name, price_cents, stock, created_at
+    `, sku, name, price, stock).Scan(
+		&p.ID,
+		&p.SKU,
+		&p.Name,
+		&p.Price,
+		&p.Stock,
+		&p.CreatedAt,
+	)
+
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return domain.Product{}, ErrConflict
+		}
+		return domain.Product{}, err
+	}
+
+	return p, nil
 }
 
 func (s *Store) ListProducts(ctx context.Context) ([]domain.Product, error) {
@@ -53,7 +87,17 @@ func (s *Store) ListProducts(ctx context.Context) ([]domain.Product, error) {
 }
 
 func (s *Store) CreateOrder(ctx context.Context, input domain.CreateOrderInput) (domain.Order, error) {
-	if input.CustomerEmail == "" || len(input.Items) == 0 {
+	email := strings.TrimSpace(input.CustomerEmail)
+	if email == "" || len(input.Items) == 0 {
+		return domain.Order{}, ErrInvalidInput
+	}
+
+	parsedEmail, err := mail.ParseAddress(email)
+	if err != nil {
+		return domain.Order{}, ErrInvalidInput
+	}
+
+	if err != nil || parsedEmail.Address != email {
 		return domain.Order{}, ErrInvalidInput
 	}
 
@@ -71,7 +115,7 @@ func (s *Store) CreateOrder(ctx context.Context, input domain.CreateOrderInput) 
         INSERT INTO orders (customer_email, status, total_cents)
         VALUES ($1, 'created', 0)
         RETURNING id, customer_email, status, total_cents, created_at
-    `, input.CustomerEmail).Scan(
+    `, email).Scan(
 		&result.ID,
 		&result.CustomerEmail,
 		&result.Status,
@@ -137,7 +181,10 @@ func (s *Store) CreateOrder(ctx context.Context, input domain.CreateOrderInput) 
 			return domain.Order{}, err
 		}
 
-		total += price * int64(item.Quantity)
+		total, err = addOrderItemTotal(total, price, item.Quantity)
+		if err != nil {
+			return domain.Order{}, err
+		}
 	}
 
 	_, err = tx.Exec(ctx, `
@@ -189,29 +236,49 @@ func (s *Store) GetOrder(ctx context.Context, id int64) (domain.Order, error) {
 }
 
 func (s *Store) CancelOrder(ctx context.Context, id int64) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
 	var status string
-	err := s.db.QueryRow(ctx, `SELECT status FROM orders WHERE id = $1`, id).Scan(&status)
+	err = tx.QueryRow(ctx, `
+		SELECT status
+		FROM orders
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&status)
+
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
 	}
+
 	if status == "cancelled" {
-		return nil
+		return tx.Commit(ctx)
 	}
 
-	rows, err := s.db.Query(ctx, `
-		SELECT product_id, quantity FROM order_items WHERE order_id = $1
+	rows, err := tx.Query(ctx, `
+		SELECT product_id, quantity
+		FROM order_items
+		WHERE order_id = $1
 	`, id)
 	if err != nil {
 		return err
 	}
+
 	type line struct {
 		productID int64
 		quantity  int
 	}
+
 	var lines []line
+
 	for rows.Next() {
 		var l line
 		if err := rows.Scan(&l.productID, &l.quantity); err != nil {
@@ -220,16 +287,50 @@ func (s *Store) CancelOrder(ctx context.Context, id int64) error {
 		}
 		lines = append(lines, l)
 	}
+
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
 	rows.Close()
 
 	for _, l := range lines {
-		_, err := s.db.Exec(ctx, `
-			UPDATE products SET stock = stock + $1 WHERE id = $2
+		tag, err := tx.Exec(ctx, `
+			UPDATE products
+			SET stock = stock + $1
+			WHERE id = $2
 		`, l.quantity, l.productID)
 		if err != nil {
 			return err
 		}
+
+		if tag.RowsAffected() != 1 {
+			return ErrNotFound
+		}
 	}
-	_, err = s.db.Exec(ctx, `UPDATE orders SET status = 'cancelled' WHERE id = $1`, id)
-	return err
+
+	_, err = tx.Exec(ctx, `
+		UPDATE orders
+		SET status = 'cancelled'
+		WHERE id = $1
+	`, id)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+func addOrderItemTotal(total, price int64, quantity int) (int64, error) {
+	if price < 0 || quantity <= 0 {
+		return 0, ErrInvalidInput
+	}
+
+	q := int64(quantity)
+
+	if price > 0 && q > (math.MaxInt64-total)/price {
+		return 0, ErrInvalidInput
+	}
+
+	return total + price*q, nil
 }

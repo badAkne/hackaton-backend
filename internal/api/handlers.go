@@ -67,12 +67,27 @@ func (a *API) createProduct(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_input")
 		return
 	}
-	product, err := a.store.CreateProduct(r.Context(), input.SKU, input.Name, input.Price, input.Stock)
-	if err != nil {
+	product, err := a.store.CreateProduct(
+		r.Context(),
+		input.SKU,
+		input.Name,
+		input.Price,
+		input.Stock,
+	)
+
+	switch {
+	case errors.Is(err, store.ErrInvalidInput):
+		writeError(w, http.StatusBadRequest, "invalid_input")
+
+	case errors.Is(err, store.ErrConflict):
+		writeError(w, http.StatusConflict, "sku_already_exists")
+
+	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal_error")
-		return
+
+	default:
+		writeJSON(w, http.StatusCreated, product)
 	}
-	writeJSON(w, http.StatusCreated, product)
 }
 
 func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
