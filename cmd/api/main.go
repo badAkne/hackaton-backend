@@ -11,9 +11,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/hackathon/inventory-order-management/internal/api"
-	"github.com/hackathon/inventory-order-management/internal/config"
-	"github.com/hackathon/inventory-order-management/internal/store"
+	"github.com/badAkne/hackaton-backend/internal/api"
+	"github.com/badAkne/hackaton-backend/internal/config"
+	"github.com/badAkne/hackaton-backend/internal/store"
 )
 
 func main() {

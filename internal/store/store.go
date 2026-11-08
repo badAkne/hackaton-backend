@@ -4,10 +4,9 @@ import (
 	"context"
 	"errors"
 
+	"github.com/badAkne/hackaton-backend/internal/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/hackathon/inventory-order-management/internal/domain"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -52,7 +51,6 @@ func (s *Store) ListProducts(ctx context.Context) ([]domain.Product, error) {
 	}
 	return products, rows.Err()
 }
-
 
 func (s *Store) CreateOrder(ctx context.Context, input domain.CreateOrderInput) (domain.Order, error) {
 	if input.CustomerEmail == "" || len(input.Items) == 0 {
@@ -174,7 +172,10 @@ func (s *Store) CancelOrder(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	type line struct { productID int64; quantity int }
+	type line struct {
+		productID int64
+		quantity  int
+	}
 	var lines []line
 	for rows.Next() {
 		var l line

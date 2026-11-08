@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hackathon/inventory-order-management/internal/domain"
-	"github.com/hackathon/inventory-order-management/internal/store"
+	"github.com/badAkne/hackaton-backend/internal/domain"
+	"github.com/badAkne/hackaton-backend/internal/store"
 )
 
 type API struct {
